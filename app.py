@@ -16,7 +16,7 @@ from PIL import Image, ImageOps
 
 # NOTE: talks to the Gemini web API directly with `requests`, so no 'google-genai' package is needed.
 # ---------------- SETTINGS YOU CAN EDIT ----------------
-DEFAULT_MODEL = "gemini-3.5-flash"   # change here (or set GEMINI_MODEL secret) if Google renames it
+DEFAULT_MODEL = "gemini-3.8-flash"   # change here (or set GEMINI_MODEL secret) if Google renames it
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 MAX_IMAGE_SIDE = 2000
 MAX_IMAGES = 6
