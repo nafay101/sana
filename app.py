@@ -1,4 +1,4 @@
-"""Notes to Quiz Maker - upload photos of your notes (or paste text) and practise with an AI quiz.
+"""AI Math Solver - upload a photo of a math question, get a step-by-step solution.
 
 Run locally:  streamlit run app.py
 """
@@ -6,59 +6,50 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import os
-import re
+import time
 
 import requests
 import streamlit as st
 from PIL import Image, ImageOps
 
-# NOTE: talks to the Gemini web API directly with `requests`, so no 'google-genai' package is needed.
-# ---------------- SETTINGS YOU CAN EDIT ----------------
-DEFAULT_MODEL = "gemini-3.8-flash"   # change here (or set GEMINI_MODEL secret) if Google renames it
+# NOTE: this app talks to the Gemini web API directly with `requests`,
+# so it does NOT need the 'google-genai' package (avoids install/import errors).
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-MAX_IMAGE_SIDE = 2000
-MAX_IMAGES = 6
+
+# ---------------- SETTINGS YOU CAN EDIT ----------------
+DEFAULT_MODEL = "gemini3.5-flash"   # change here (or set GEMINI_MODEL) if Google renames it
+FALLBACK_MODELS = ["gemini-3.8-flash-lite"]   # backup model if the main one is busy / out of free quota
+RETRY_WAIT_SECONDS = 8
+MAX_IMAGE_SIDE = 2000                # big photos are shrunk to this many pixels (faster, cheaper)
 MAX_UPLOAD_MB = 10
-MAX_TEXT_CHARS = 30000
 # --------------------------------------------------------
 
-LETTERS = "ABCD"
-DIFFICULTY = {
-    "Easy": "Easy: direct recall of facts and definitions.",
-    "Medium": "Medium: understanding and applying the ideas.",
-    "Hard": "Hard: tricky, application and reasoning questions with close wrong options.",
-}
-
-SYSTEM_PROMPT = """You are an expert teacher who writes exam practice questions.
-Create multiple-choice questions ONLY from the study material given (images of notes and/or text).
-Rules:
-- Every question has exactly 4 options and exactly ONE correct option.
-- Wrong options must be believable, not silly. Do not use "all of the above" or "none of the above".
-- Spread questions across the whole material; do not repeat the same idea.
-- Give a short, simple explanation of why the correct answer is right.
-- Do not invent facts that are not supported by the material.
-- Write in the same language as the material.
-- If the material is unreadable or contains nothing to study, return an empty list.
+SYSTEM_PROMPT = """You are a patient, friendly math tutor.
+The student sends a photo of a math question. Do this:
+1. Read the question carefully from the image. If part of it is unreadable, say exactly what
+   you could not read and state the assumption you made.
+2. Solve it correctly. Double-check the final answer before replying.
+3. Reply in Markdown with exactly these sections:
+   ## Question
+   (write the question you read, so the student can confirm it is right)
+   ## Solution
+   (numbered steps, one idea per step, show the working)
+   ## Final Answer
+   (short, in bold)
+   ## Explanation
+   (explain WHY each step works, in simple words, and name the rule or formula used)
+4. Write all math in LaTeX: $...$ for inline and $$...$$ for display equations.
+5. If the image is not a math question, say so politely and ask for a clearer picture.
 """
 
-SCHEMA = {
-    "type": "ARRAY",
-    "items": {
-        "type": "OBJECT",
-        "properties": {
-            "question": {"type": "STRING"},
-            "options": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "answer_index": {"type": "INTEGER"},
-            "explanation": {"type": "STRING"},
-        },
-        "required": ["question", "options", "answer_index", "explanation"],
-    },
+LEVELS = {
+    "Simple (easy words)": "Explain like I am a beginner. Use very simple words and short sentences.",
+    "Normal": "Explain clearly at a normal high-school / university level.",
+    "Detailed": "Give a detailed explanation, mention alternative methods and common mistakes.",
 }
 
 
-# ---------------- helpers ----------------
 def get_secret(name: str, default: str = "") -> str:
     """Read a setting from Streamlit secrets first, then environment variables."""
     try:
@@ -71,10 +62,11 @@ def get_secret(name: str, default: str = "") -> str:
 
 
 def prepare_image(data: bytes) -> tuple[bytes, str]:
-    """Fix phone rotation, shrink big photos, return (jpeg_bytes, mime_type)."""
+    """Fix phone rotation, shrink very large photos, return (jpeg_bytes, mime_type)."""
     img = Image.open(io.BytesIO(data))
     img = ImageOps.exif_transpose(img)
     if img.mode not in ("RGB", "L"):
+        # flatten transparency onto white so PNG screenshots stay readable
         rgba = img.convert("RGBA")
         bg = Image.new("RGB", rgba.size, "white")
         bg.paste(rgba, mask=rgba.split()[-1])
@@ -83,72 +75,27 @@ def prepare_image(data: bytes) -> tuple[bytes, str]:
         img = img.convert("RGB")
     img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
     out = io.BytesIO()
-    img.save(out, format="JPEG", quality=90)
+    img.save(out, format="JPEG", quality=92)
     return out.getvalue(), "image/jpeg"
 
 
-def build_prompt(n: int, difficulty: str, text: str) -> str:
-    prompt = (f"Write exactly {n} multiple-choice questions from the study material below.\n"
-              f"Difficulty - {DIFFICULTY.get(difficulty, DIFFICULTY['Medium'])}\n")
-    if text.strip():
-        prompt += "\nSTUDY MATERIAL (text):\n" + text.strip()[:MAX_TEXT_CHARS]
-    else:
-        prompt += "\nThe study material is in the attached image(s)."
-    return prompt
+def build_prompt(level: str, extra: str) -> str:
+    text = "Solve the math question in this image.\n" + LEVELS.get(level, LEVELS["Normal"])
+    if extra.strip():
+        text += "\nExtra instruction from the student: " + extra.strip()
+    return text
 
 
-def clean_questions(raw) -> list[dict]:
-    """Keep only well-formed questions: 4 non-empty options, valid answer index."""
-    good = []
-    if not isinstance(raw, list):
-        return good
-    for q in raw:
-        try:
-            question = str(q["question"]).strip()
-            options = [str(o).strip() for o in q["options"]]
-            idx = int(q["answer_index"])
-            explanation = str(q.get("explanation", "")).strip()
-        except (KeyError, TypeError, ValueError, AttributeError):
-            continue
-        if question and len(options) == 4 and all(options) and 0 <= idx < 4 \
-                and len(set(options)) == 4:
-            good.append({"question": question, "options": options,
-                         "answer_index": idx, "explanation": explanation})
-    return good
-
-
-def parse_quiz(text: str) -> list[dict]:
-    """Parse the AI reply into a clean question list (tolerates ```json fences)."""
-    text = (text or "").strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
-    try:
-        data = json.loads(text)
-    except ValueError:
-        m = re.search(r"\[.*\]", text, flags=re.DOTALL)
-        if not m:
-            return []
-        try:
-            data = json.loads(m.group(0))
-        except ValueError:
-            return []
-    if isinstance(data, dict):  # sometimes wrapped as {"questions": [...]}
-        data = data.get("questions", [])
-    return clean_questions(data)
-
-
-def generate_quiz(api_key: str, model: str, images: list[tuple[bytes, str]],
-                  text: str, n: int, difficulty: str) -> list[dict]:
-    parts = [{"inline_data": {"mime_type": mime, "data": base64.b64encode(b).decode()}}
-             for b, mime in images]
-    parts.append({"text": build_prompt(n, difficulty, text)})
+def solve_question(api_key: str, model: str, image_bytes: bytes, mime: str, prompt: str) -> str:
     body = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json",
-                             "responseSchema": SCHEMA},
+        "contents": [{"role": "user", "parts": [
+            {"inline_data": {"mime_type": mime, "data": base64.b64encode(image_bytes).decode()}},
+            {"text": prompt},
+        ]}],
+        "generationConfig": {"temperature": 0.2},
     }
-    resp = requests.post(API_URL.format(model=model), json=body, timeout=180,
-                         headers={"x-goog-api-key": api_key, "Content-Type": "application/json"})
+    resp = call_gemini(api_key, model, body, 120)
     if resp.status_code != 200:
         try:
             detail = resp.json().get("error", {}).get("message", resp.text)
@@ -156,27 +103,30 @@ def generate_quiz(api_key: str, model: str, images: list[tuple[bytes, str]],
             detail = resp.text
         raise RuntimeError(f"{resp.status_code} {detail}")
     try:
-        reply = "".join(p.get("text", "") for p in resp.json()["candidates"][0]["content"]["parts"])
+        parts = resp.json()["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts).strip()
     except (KeyError, IndexError, TypeError, ValueError):
-        reply = ""
-    quiz = parse_quiz(reply)
-    if not quiz:
-        raise RuntimeError("No questions could be made. Try clearer notes or add more text.")
-    return quiz[:n]
+        text = ""
+    if not text:
+        raise RuntimeError("The AI returned an empty answer (the image may have been blocked). "
+                           "Try a clearer picture.")
+    return text
 
 
-def quiz_to_markdown(quiz: list[dict]) -> str:
-    lines = ["# Practice Quiz", ""]
-    for i, q in enumerate(quiz, 1):
-        lines.append(f"**Q{i}. {q['question']}**")
-        for j, opt in enumerate(q["options"]):
-            lines.append(f"- {LETTERS[j]}. {opt}")
-        lines.append("")
-    lines += ["---", "## Answer key", ""]
-    for i, q in enumerate(quiz, 1):
-        a = q["answer_index"]
-        lines.append(f"{i}. **{LETTERS[a]}. {q['options'][a]}** - {q['explanation']}")
-    return "\n".join(lines)
+def call_gemini(api_key: str, model: str, body: dict, timeout: int):
+    """Send the request. On 'too many requests' wait and retry, then try the backup model."""
+    resp = None
+    for m in [model] + [x for x in FALLBACK_MODELS if x != model]:
+        for attempt in range(2):
+            resp = requests.post(API_URL.format(model=m), json=body, timeout=timeout,
+                                 headers={"x-goog-api-key": api_key, "Content-Type": "application/json"})
+            if resp.status_code in (429, 503) and attempt == 0:
+                time.sleep(RETRY_WAIT_SECONDS)
+                continue
+            break
+        if resp.status_code not in (429, 503, 404):
+            return resp
+    return resp
 
 
 def friendly_error(exc: Exception) -> str:
@@ -185,60 +135,19 @@ def friendly_error(exc: Exception) -> str:
     if "api key" in low or "api_key" in low or "permission" in low or "401" in low or "403" in low:
         return "Your Gemini API key looks invalid. Check it and try again."
     if "429" in low or "quota" in low or "resource_exhausted" in low:
-        return "Too many requests or the free limit is used up. Wait a minute and try again."
+        return ("Too many requests / free limit reached. Google says: " + msg[:250] + "  -> Wait 1-2 minutes and "
+                "try again. If it keeps happening, the DAILY free limit is used up: try tomorrow, or turn on "
+                "billing in Google AI Studio.")
     if "404" in low or "not found" in low:
         return f"The model name was not found. Change DEFAULT_MODEL (or GEMINI_MODEL). Details: {msg}"
-    if "timed out" in low or "timeout" in low or "connection" in low:
-        return "Could not reach Gemini (network problem or timeout). Please try again."
     return f"Something went wrong: {msg}"
 
 
-def reset_answers() -> None:
-    for key in [k for k in st.session_state if str(k).startswith("quizq_")]:
-        del st.session_state[key]
-    st.session_state["checked"] = False
-
-
-# ---------------- page ----------------
-def show_quiz(quiz: list[dict]) -> None:
-    st.divider()
-    st.subheader(f"📝 Your quiz ({len(quiz)} questions)")
-    checked = st.session_state.get("checked", False)
-    for i, q in enumerate(quiz):
-        labels = [f"{LETTERS[j]}. {opt}" for j, opt in enumerate(q["options"])]
-        st.markdown(f"**Q{i + 1}. {q['question']}**")
-        choice = st.radio("Choose one", labels, index=None, key=f"quizq_{i}",
-                          label_visibility="collapsed", disabled=checked)
-        if checked:
-            right = labels[q["answer_index"]]
-            if choice == right:
-                st.success(f"✅ Correct! {q['explanation']}")
-            elif choice is None:
-                st.warning(f"Skipped. Correct answer: **{right}**. {q['explanation']}")
-            else:
-                st.error(f"❌ Wrong. Correct answer: **{right}**. {q['explanation']}")
-
-    if not checked:
-        if st.button("Check my answers", type="primary"):
-            st.session_state["checked"] = True
-            st.rerun()
-    else:
-        score = sum(1 for i, q in enumerate(quiz)
-                    if st.session_state.get(f"quizq_{i}") == f"{LETTERS[q['answer_index']]}. "
-                    f"{q['options'][q['answer_index']]}")
-        st.metric("Your score", f"{score} / {len(quiz)}", f"{round(100 * score / len(quiz))}%")
-        if st.button("Try again (same questions)"):
-            reset_answers()
-            st.rerun()
-    st.download_button("Download quiz + answer key (.md)", quiz_to_markdown(quiz),
-                       file_name="quiz.md")
-
-
 def main() -> None:
-    st.set_page_config(page_title="Notes to Quiz Maker", page_icon="📝", layout="centered")
-    st.title("📝 Notes to Quiz Maker")
-    st.write("Upload photos of your notes or paste text, and get a practice quiz with answers "
-             "and explanations.")
+    st.set_page_config(page_title="AI Math Solver", page_icon="🧮", layout="centered")
+    st.title("🧮 AI Math Solver")
+    st.write("Upload a photo of any math question and get a step-by-step solution "
+             "with a simple explanation.")
 
     with st.sidebar:
         st.header("Settings")
@@ -249,48 +158,46 @@ def main() -> None:
         else:
             st.success("API key loaded ✔")
         model = get_secret("GEMINI_MODEL", DEFAULT_MODEL)
-        n = st.slider("Number of questions", 3, 20, 10)
-        difficulty = st.selectbox("Difficulty", list(DIFFICULTY), index=1)
+        level = st.selectbox("Explanation style", list(LEVELS))
         st.caption(f"Model: {model}")
 
-    files = st.file_uploader(f"Upload notes (up to {MAX_IMAGES} photos)",
-                             type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
-    text = st.text_area("...or paste your notes here", height=150)
+    uploaded = st.file_uploader("Upload the question (photo or screenshot)",
+                                type=["png", "jpg", "jpeg", "webp"])
+    use_camera = st.toggle("Or take a photo with the camera")
+    camera = st.camera_input("Take a photo") if use_camera else None
+    source = uploaded or camera
+    extra = st.text_input("Optional note (e.g. 'solve only part b')")
 
-    if files:
-        st.image([f for f in files[:MAX_IMAGES]], width=150)
+    if source is not None:
+        st.image(source, caption="Your question", use_container_width=True)
 
-    if st.button("Make my quiz", type="primary", disabled=not (files or text.strip())):
+    if st.button("Solve it", type="primary", disabled=source is None):
         if not api_key:
             st.error("Please enter your Gemini API key in the sidebar.")
             return
-        if len(files) > MAX_IMAGES:
-            st.error(f"Please upload at most {MAX_IMAGES} images.")
+        raw = source.getvalue()
+        if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
+            st.error(f"Image is larger than {MAX_UPLOAD_MB} MB. Please use a smaller one.")
             return
-        images = []
-        for f in files:
-            raw = f.getvalue()
-            if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
-                st.error(f"'{f.name}' is larger than {MAX_UPLOAD_MB} MB.")
-                return
-            try:
-                images.append(prepare_image(raw))
-            except Exception:
-                st.error(f"Could not open '{f.name}'. Please use PNG, JPG or WEBP.")
-                return
         try:
-            with st.spinner("Writing your questions..."):
-                quiz = generate_quiz(api_key, model, images, text, n, difficulty)
-            reset_answers()
-            st.session_state["quiz"] = quiz
-            if len(quiz) < n:
-                st.info(f"Only {len(quiz)} good questions could be made from this material.")
+            image_bytes, mime = prepare_image(raw)
+        except Exception:
+            st.error("Could not open that image. Please upload a PNG, JPG or WEBP file.")
+            return
+        try:
+            with st.spinner("Solving..."):
+                answer = solve_question(api_key, model, image_bytes, mime, build_prompt(level, extra))
+            st.session_state["answer"] = answer
         except Exception as exc:
+            st.session_state.pop("answer", None)
             st.error(friendly_error(exc))
 
-    if st.session_state.get("quiz"):
-        show_quiz(st.session_state["quiz"])
-        st.caption("AI can make mistakes. Check important facts against your textbook.")
+    if st.session_state.get("answer"):
+        st.divider()
+        st.markdown(st.session_state["answer"])
+        st.download_button("Download solution (.md)", st.session_state["answer"],
+                           file_name="solution.md")
+        st.caption("AI can make mistakes. Always double-check important answers.")
 
 
 if __name__ == "__main__":
